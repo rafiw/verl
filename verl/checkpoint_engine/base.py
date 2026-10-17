@@ -440,6 +440,12 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        # set while a sync is writing rollout weights; a failed sync leaves it set, so generation stays
+        # blocked until a later sync completes. It lives in this manager, so a replica resumed through
+        # another handle (fully_async rollouter rebalance) bypasses it; move it onto the server actors
+        # if those paths need it
+        self._weights_dirty = False
+        self._applied_global_steps = None
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -508,6 +514,11 @@ class CheckpointEngineManager:
     @auto_await
     async def resume_generation_replicas(self):
         """Resume generation on all replicas after abort_all_requests."""
+        if self._weights_dirty:
+            raise RuntimeError(
+                "rollout weights are mixed after a failed weight sync (last complete sync: global step "
+                f"{self._applied_global_steps}); run update_weights again before resuming generation"
+            )
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await
@@ -559,10 +570,13 @@ class CheckpointEngineManager:
 
         # 5. update weights of all workers
         rollout.fetch_rollout_layout()
+        self._weights_dirty = True
         results = ray.get(
             actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
             + rollout.update_weights(global_steps=global_steps)
         )
+        self._weights_dirty = False
+        self._applied_global_steps = global_steps
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}
